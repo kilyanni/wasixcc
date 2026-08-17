@@ -1,0 +1,271 @@
+name: Wasinix command
+
+# `/wasinix <command>` on a wasixcc pull request, run through the wasinix
+# machinery: the jobs check out wasix-org/wasinix and hand it this repo's
+# issue_comment event. wasinix's authorization re-reads the comment, the
+# commenter's permission, and the PR head from this repository's API, and
+# its normalization maps a foreign PR onto an override of the wasixcc pin,
+# so the command builds wasinix with this PR's wasixcc spliced in.
+#
+# A port of wasinix's ci-command.yml. Mutation commands rewrite a wasinix PR
+# branch, which a wasixcc PR does not have; they get a reply instead of a run.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+concurrency:
+  group: wasinix-command-${{ github.repository_id }}-pr-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    # cheap pre-filter only; authorization decides for real
+    if: >-
+      github.event.issue.pull_request && contains(github.event.comment.body,
+      '/wasinix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      kind: ${{ steps.authorize.outputs.kind }}
+      commentId: ${{ steps.authorize.outputs.commentId }}
+      pullRequest: ${{ steps.authorize.outputs.pullRequest }}
+      headSha: ${{ steps.authorize.outputs.headSha }}
+    steps:
+      # Heard, seconds after posting: authorization needs the wasinix binary
+      # and can take minutes when its closure is cold. Advisory, so failures
+      # pass.
+      - name: Acknowledge
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api --silent \
+            "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes || true
+
+      - name: Checkout wasinix
+        uses: actions/checkout@v4
+        with:
+          repository: wasix-org/wasinix
+
+      # wasinix's .github/actions/setup-nix, inlined: nix config from
+      # `wasinix ci nix-config`, plus the flake-inputs cache.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.9.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://nix-cache.wasix.org
+            extra-trusted-public-keys = wasinix-1:jvsqbOJGsZxMvg97fuyNCWCc+t2nn6uHB47kQCGNmXI=
+            trusted-users = root runner
+
+      - name: Cache flake inputs
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          # the fetcher-cache sqlite pins narHashes that do not reproduce on
+          # a fresh VM; see wasinix's setup-nix action
+          path: |
+            ~/.cache/nix
+            !~/.cache/nix/fetcher-cache-v*.sqlite*
+          key: nix-flake-inputs-v2-${{ hashFiles('flake.lock') }}
+          restore-keys: nix-flake-inputs-v2-
+
+      - name: Authorize
+        id: authorize
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          nix run .#wasinix -- ci origin \
+            --event "$GITHUB_EVENT_PATH" \
+            --allowed-owner "$GITHUB_REPOSITORY_OWNER" \
+            --github-output "$GITHUB_OUTPUT" \
+            --out origin-command.json 2>auth-error.txt
+          code=$?
+          cat auth-error.txt >&2
+          exit "$code"
+
+      - name: Share the failure detail
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: errors-authorize
+          path: "*-error.txt"
+          if-no-files-found: ignore
+
+      # the reaction comes after parsing, so a typo gets a reply, not an eye
+      - name: Acknowledge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes >/dev/null
+
+      - name: Share the authorized command
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: origin-command
+          path: origin-command.json
+
+  build:
+    needs: authorize
+    if: needs.authorize.outputs.kind == 'build'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout wasinix
+        uses: actions/checkout@v4
+        with:
+          repository: wasix-org/wasinix
+          fetch-depth: 0
+
+      # No PR-head fetch here, unlike wasinix's build job: the PR head is a
+      # wasixcc commit, and it reaches the run as a pin override that the
+      # update machinery fetches from GitHub, not as a git object.
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.9.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://nix-cache.wasix.org
+            extra-trusted-public-keys = wasinix-1:jvsqbOJGsZxMvg97fuyNCWCc+t2nn6uHB47kQCGNmXI=
+            trusted-users = root runner
+
+      - name: Cache flake inputs
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: |
+            ~/.cache/nix
+            !~/.cache/nix/fetcher-cache-v*.sqlite*
+          key: nix-flake-inputs-v2-${{ hashFiles('flake.lock') }}
+          restore-keys: nix-flake-inputs-v2-
+
+      - name: Fetch the authorized command
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: origin-command
+
+      - name: Run command
+        id: run
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # fewer eval workers than wasinix's 16-core depot runner carries
+          WASINIX_EVAL_WORKERS: "2"
+          WASINIX_EVAL_MEMORY: "4096"
+          # optional: without NIX_SIGNING_KEY the run builds but pushes
+          # nothing to the shared cache
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+        run: |
+          push_cache=()
+          if [ -n "$NIX_SIGNING_KEY" ]; then push_cache=(--push-cache); fi
+          # The runner names this repository, but normalization compares the
+          # PR's base repo against GITHUB_REPOSITORY to decide between
+          # building a wasinix revision and overriding the wasixcc pin; point
+          # it at the checkout so the PR becomes the override.
+          export GITHUB_REPOSITORY=wasix-org/wasinix
+          nix run .#wasinix -- ci command \
+            --origin origin-command.json \
+            --run-dir run-dir \
+            "${push_cache[@]}" 2> >(tee run-error.txt >&2)
+
+      # GITHUB_REPOSITORY is this repository again: the report's comment and
+      # check run belong on the wasixcc pull request.
+      - name: Post report
+        if: always() && steps.run.conclusion != 'skipped'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.authorize.outputs.headSha }}
+          PULL_REQUEST: ${{ needs.authorize.outputs.pullRequest }}
+          COMMENT_ID: ${{ needs.authorize.outputs.commentId }}
+        run: |
+          nix run .#wasinix -- ci publish --run-dir run-dir \
+            --sha "$HEAD_SHA" \
+            --pull-request "$PULL_REQUEST" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --comment --reply-to "$COMMENT_ID" --check \
+            --step-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Share the failure detail
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: errors-build
+          path: "*-error.txt"
+          if-no-files-found: ignore
+
+  # Mutations run the wasinix tree's own update scripts against the PR branch
+  # and push it back; wasinix's mutation machinery accepts them only on the
+  # repository it checked out (github/mutation.rs), and a wasixcc branch holds
+  # no wasinix tree to mutate. Reply rather than silently dropping the command.
+  reply-mutation:
+    needs: authorize
+    if: needs.authorize.outputs.kind == 'mutation'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Reply
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.issue.number }}/comments" \
+            -f body="\`/wasinix\` mutation commands (update, bump, regenerate) rewrite a wasinix pull-request branch and are not available on wasixcc pull requests." >/dev/null
+
+  # a command must never fail silently: authorization and run errors reply
+  # to the comment that asked
+  reply-on-error:
+    needs: [authorize, build, reply-mutation]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout wasinix
+        uses: actions/checkout@v4
+        with:
+          repository: wasix-org/wasinix
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31.9.1
+        with:
+          extra_nix_config: |
+            extra-substituters = https://nix-cache.wasix.org
+            extra-trusted-public-keys = wasinix-1:jvsqbOJGsZxMvg97fuyNCWCc+t2nn6uHB47kQCGNmXI=
+            trusted-users = root runner
+
+      - name: Fetch failure detail
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: errors-*
+          merge-multiple: true
+
+      - name: Reply on error
+        id: reply
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          nix run .#wasinix -- ci reply \
+            --pull-request '${{ github.event.issue.number }}' \
+            --comment-id '${{ github.event.comment.id }}' \
+            --failure auth-error.txt --failure run-error.txt \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      # last resort for a job that died before the binary could run; the body
+      # is constant, so no markdown is produced outside the wasinix crate
+      - name: Reply fallback
+        if: failure() && steps.reply.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/issues/${{ github.event.issue.number }}/comments" \
+            -f body="❌ \`/wasinix\` command failed before it could report; see the [Actions run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)." >/dev/null
